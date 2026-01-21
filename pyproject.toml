@@ -1,0 +1,28 @@
+[project]
+name = "dialer"
+version = "0.1.0"
+description = "A wardialer using USB modems"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+    "scipy>=1.10.0",
+    "numpy>=1.24.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "scikit-learn>=1.0.0",
+    "hmmlearn>=0.3.0",
+    "eyed3>=0.9.0",
+    "pydub>=0.25.0",
+]
+
+[project.scripts]
+dialer = "dialer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dialer"]
