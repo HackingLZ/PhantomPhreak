@@ -1,4 +1,4 @@
-# Phone Line Scanner (Wardialer)
+# War Dialer
 
 A phone line scanner that uses USB modems to dial numbers and classify what answers (fax, modem, voice, etc.) using audio frequency analysis, tone cadence detection, and machine learning.
 
