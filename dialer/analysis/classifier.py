@@ -334,10 +334,17 @@ class Classifier:
             return make_result(LineType.SILENCE, silence_confidence, False, True,
                              "Very low energy, minimal frequency content")
 
-        # SIT TONE DETECTION: Check for intercept messages first
-        if sit_result.is_sit and sit_result.confidence > 0.7:
-            return make_result(LineType.SIT_TONE, sit_result.confidence, False, False,
-                             sit_result.reasoning)
+        # SIT TONE DETECTION: Check for intercept messages
+        # Require high confidence AND verify it's not actually voice
+        if sit_result.is_sit and sit_result.confidence > 0.75:
+            # Double-check: SIT should NOT have voice characteristics
+            # Voice has many unique frequencies and variable energy
+            is_voice_check, voice_conf = self._check_voice(analysis, frequencies)
+            if not is_voice_check or voice_conf < 0.4:
+                # Not voice-like, accept as SIT
+                return make_result(LineType.SIT_TONE, sit_result.confidence, False, False,
+                                 sit_result.reasoning)
+            # Has voice characteristics - likely misdetection, continue classification
 
         # Match against all signatures
         matches = []
@@ -357,7 +364,8 @@ class Classifier:
                              f"Ringback: {cadence_result.on_duration:.2f}s on / {cadence_result.off_duration:.2f}s off")
 
         # DTMF/IVR DETECTION: Check for phone menus
-        if dtmf_result.has_ivr and dtmf_result.ivr_confidence > 0.6:
+        # Require high confidence AND multiple digits to avoid false positives from voice
+        if dtmf_result.has_ivr and dtmf_result.ivr_confidence > 0.7 and len(dtmf_result.digits) >= 3:
             return make_result(LineType.IVR, dtmf_result.ivr_confidence, False, False,
                              f"IVR/Phone menu: {dtmf_result.reasoning}")
 
@@ -365,6 +373,10 @@ class Classifier:
         has_2100 = 2100 in frequencies
         has_2200 = 2200 in frequencies
         has_1100 = 1100 in frequencies
+
+        # Calculate recording duration from number of frames
+        # Each frame is typically 1 second of audio with default FFT settings
+        recording_duration = len(analysis.frames) if analysis.frames else 0
 
         # Modem: 2100 + 2200 Hz together
         if has_2100 and has_2200:
@@ -377,14 +389,35 @@ class Classifier:
                                  f"Modem detected: 2100 Hz ({count_2100} frames) + 2200 Hz ({count_2200} frames)")
 
         # Fax: 2100 Hz alone (CED) or 1100 Hz (CNG)
+        # Be more conservative: modems also start with 2100 Hz, then add 2200 Hz
+        # If recording is short, we might not have captured the 2200 Hz yet
         if has_2100 or has_1100:
             fax_freq = 2100 if has_2100 else 1100
             fax_count = freq_counts.get(fax_freq, 0)
-            if fax_count >= 3:
-                fax_match = next((m for m in matches if m.signature.line_type == LineType.FAX), None)
-                confidence = max(fax_match.confidence if fax_match else 0.7, 0.85)
-                return make_result(LineType.FAX, confidence, False, False,
-                                 f"Fax detected: {fax_freq} Hz tone present in {fax_count} frames")
+
+            # For 2100 Hz, require more evidence since modems also use it
+            # 1100 Hz (CNG calling tone) is more distinctive to fax
+            if fax_freq == 2100:
+                # Need more frames AND longer recording for confidence with 2100 Hz
+                min_frames_needed = 5  # Require 5+ frames of 2100 Hz for fax
+                if fax_count >= min_frames_needed and recording_duration >= 5:
+                    # Long enough recording with consistent 2100 Hz and NO 2200 Hz = fax
+                    fax_match = next((m for m in matches if m.signature.line_type == LineType.FAX), None)
+                    confidence = max(fax_match.confidence if fax_match else 0.7, 0.80)
+                    return make_result(LineType.FAX, confidence, False, False,
+                                     f"Fax detected: {fax_freq} Hz tone present in {fax_count} frames")
+                elif fax_count >= 3:
+                    # Recording has 2100 Hz but either not enough frames or not long enough
+                    # Could be fax OR modem - mark as INTERESTING for manual review
+                    return make_result(LineType.INTERESTING, 0.6, False, False,
+                                     f"Possible fax/modem: 2100 Hz detected ({fax_count} frames, {recording_duration}s), needs longer capture")
+            else:
+                # 1100 Hz is more specific to fax (CNG calling tone)
+                if fax_count >= 3:
+                    fax_match = next((m for m in matches if m.signature.line_type == LineType.FAX), None)
+                    confidence = max(fax_match.confidence if fax_match else 0.7, 0.85)
+                    return make_result(LineType.FAX, confidence, False, False,
+                                     f"Fax detected: {fax_freq} Hz CNG tone present in {fax_count} frames")
 
         # Check for voice
         is_voice, voice_confidence = self._check_voice(analysis, frequencies)
@@ -397,8 +430,8 @@ class Classifier:
 
         # If ML says voice with high confidence, trust it
         if ml_type == LineType.VOICE and ml_confidence > 0.7:
-            # But check for answering machine first
-            if am_result.is_answering_machine and am_result.confidence > 0.5:
+            # But check for answering machine first - require HIGH confidence
+            if am_result.is_answering_machine and am_result.confidence > 0.7 and am_result.beep_detected:
                 line_type = LineType.VOICEMAIL if am_result.is_voicemail else LineType.ANSWERING_MACHINE
                 return make_result(line_type, am_result.confidence, True, False,
                                  f"ML voice + {am_result.reasoning}")
@@ -409,8 +442,8 @@ class Classifier:
         # If we detect voice characteristics AND the tone match is weak/ambiguous
         # (like dial_tone which shares frequencies with voice), prefer voice
         if is_voice and voice_confidence >= 0.5:
-            # Check for answering machine
-            if am_result.is_answering_machine and am_result.confidence > 0.5:
+            # Check for answering machine - require beep AND high confidence
+            if am_result.is_answering_machine and am_result.confidence > 0.7 and am_result.beep_detected:
                 line_type = LineType.VOICEMAIL if am_result.is_voicemail else LineType.ANSWERING_MACHINE
                 return make_result(line_type, am_result.confidence, True, False,
                                  am_result.reasoning)
@@ -454,8 +487,8 @@ class Classifier:
 
         # Voice detected
         if is_voice and voice_confidence >= 0.4:
-            # Check for answering machine one more time
-            if am_result.is_answering_machine and am_result.confidence > 0.4:
+            # Check for answering machine - require beep AND high confidence
+            if am_result.is_answering_machine and am_result.confidence > 0.7 and am_result.beep_detected:
                 line_type = LineType.VOICEMAIL if am_result.is_voicemail else LineType.ANSWERING_MACHINE
                 return make_result(line_type, am_result.confidence, True, False, am_result.reasoning)
             return make_result(LineType.VOICE, voice_confidence, True, False,

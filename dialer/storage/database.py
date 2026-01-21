@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from ..analysis.signatures import LineType
-from ..core.modem import CallResult
+from ..core.provider import CallResult
 from .models import Scan, ScanResult, ScanStatus, ScanSummary
 
 

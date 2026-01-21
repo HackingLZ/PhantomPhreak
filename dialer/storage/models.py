@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Optional
 
 from ..analysis.signatures import LineType
-from ..core.modem import CallResult
+from ..core.provider import CallResult
 
 
 class ScanStatus(Enum):

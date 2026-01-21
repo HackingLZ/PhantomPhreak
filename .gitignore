@@ -71,6 +71,20 @@ config.yaml
 config.yml
 !config.example.yaml
 
+# Phone number lists (may contain sensitive data)
+numbers.txt
+numbers*.txt
+phone*.txt
+targets*.txt
+
+# Credentials
+credentials.json
+secrets.yaml
+secrets.yml
+.secrets
+*.key
+*.pem
+
 # OS files
 .DS_Store
 .DS_Store?

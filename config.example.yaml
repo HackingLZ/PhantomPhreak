@@ -1,0 +1,91 @@
+# Phone Line Scanner Configuration
+# Copy this file to config.yaml and fill in your values
+
+# Telephony provider: "modem" (USB modem) or "iax2" (VOIP via IAX2)
+provider: modem
+
+modem:
+  # Serial port device (auto-detect if not specified)
+  device: null  # e.g., /dev/ttyACM0 or /dev/ttyUSB0
+
+  # Baud rate for serial communication
+  baud_rate: 460800
+
+  # Timeout for serial operations (seconds)
+  timeout: 2
+
+  # Timeout waiting for call answer (seconds)
+  call_timeout: 45
+
+  # Time to record audio after connect (seconds)
+  record_duration: 25
+
+  # Dial mode: "tone" (ATDT) or "pulse" (ATDP)
+  # Most modern lines use tone dialing
+  dial_mode: tone
+
+  # Wait for dial tone before dialing (adds 'W' to dial command)
+  # When enabled, modem will wait for dial tone before sending digits
+  # This helps verify line connectivity and avoid dialing into noise
+  detect_dial_tone: false
+
+  # Initialization string (matches wvdial defaults)
+  # ATQ0 V1 E1 S0=0 &C1 &D2 +FCLASS=0
+  # Set to null to use defaults, or customize as needed
+  init_string: null
+
+# IAX2 VOIP settings (for provider: iax2)
+# Used with VOIP.MS or other IAX2-compatible servers
+iax2:
+  # IAX2 server hostname (e.g., chicago3.voip.ms, newyork.voip.ms)
+  host: your-server.voip.ms
+
+  # IAX2 server port (default: 4569)
+  port: 4569
+
+  # IAX2 account credentials
+  username: "your_username"
+  password: "your_password"
+
+  # Caller ID to send (e.g., +15551234567)
+  caller_id: "+15551234567"
+
+audio:
+  # Sample rate for audio capture (Hz)
+  sample_rate: 8000
+
+  # Directory to store audio recordings
+  output_dir: "./recordings"
+
+  # Keep recordings for these line types (empty = keep all)
+  keep_recordings:
+    - unknown
+    - voice
+    - interesting
+
+analysis:
+  # FFT window size (samples)
+  fft_window: 1024
+
+  # Number of top frequencies to extract per second
+  top_frequencies: 5
+
+  # Round frequencies to this resolution (Hz)
+  frequency_resolution: 100
+
+  # Minimum confidence for classification (0.0 - 1.0)
+  min_confidence: 0.6
+
+scanner:
+  # Delay between calls (seconds)
+  call_delay: 3
+
+  # Maximum retries for failed calls
+  max_retries: 2
+
+  # Caller ID to send (if supported by modem)
+  caller_id: null
+
+database:
+  # SQLite database path
+  path: "./dialer.db"

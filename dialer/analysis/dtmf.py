@@ -113,17 +113,46 @@ class DTMFDetector:
         low_freq, low_power = max(low_powers, key=lambda x: x[1])
         high_freq, high_power = max(high_powers, key=lambda x: x[1])
 
-        # Calculate total power
-        total_power = sum(p for _, p in low_powers) + sum(p for _, p in high_powers)
-        if total_power == 0:
+        # Calculate total DTMF power
+        total_dtmf_power = sum(p for _, p in low_powers) + sum(p for _, p in high_powers)
+        if total_dtmf_power == 0:
             return None
 
-        # Check if the two strongest are significantly stronger than others
+        # STRICT CHECK 1: The two strongest must dominate other DTMF frequencies
+        # Real DTMF has energy at exactly two frequencies, voice spreads across many
         dtmf_power = low_power + high_power
-        other_power = total_power - dtmf_power
+        other_dtmf_power = total_dtmf_power - dtmf_power
 
-        if other_power > 0 and dtmf_power / other_power < 2.0:
-            return None  # Not a clean DTMF tone
+        if other_dtmf_power > 0 and dtmf_power / other_dtmf_power < 5.0:
+            return None  # Not a clean DTMF tone - energy at multiple DTMF frequencies
+
+        # STRICT CHECK 2: Check that low and high freqs have similar power (within 10dB)
+        # Real DTMF tones have balanced power in both frequencies
+        if low_power > 0 and high_power > 0:
+            power_ratio = max(low_power, high_power) / min(low_power, high_power)
+            if power_ratio > 10.0:  # More than 10x difference = not balanced
+                return None
+
+        # STRICT CHECK 3: Use FFT to verify these are the ONLY strong frequencies
+        # Voice has many harmonics, DTMF has only two clean tones
+        fft = np.abs(rfft(samples))
+        freqs = rfftfreq(len(samples), 1 / self.sample_rate)
+
+        # Find energy in voice-typical ranges that aren't DTMF
+        # If there's significant energy elsewhere, it's probably voice
+        voice_mask = (freqs >= 200) & (freqs <= 3500)
+        dtmf_mask = np.zeros_like(freqs, dtype=bool)
+        for f in DTMF_LOW_FREQS + DTMF_HIGH_FREQS:
+            dtmf_mask |= (np.abs(freqs - f) <= 30)
+
+        non_dtmf_voice_mask = voice_mask & ~dtmf_mask
+        non_dtmf_energy = np.sum(fft[non_dtmf_voice_mask] ** 2) if np.any(non_dtmf_voice_mask) else 0
+        dtmf_fft_energy = np.sum(fft[dtmf_mask] ** 2) if np.any(dtmf_mask) else 0
+
+        if dtmf_fft_energy > 0:
+            # DTMF energy should be much higher than non-DTMF voice energy
+            if non_dtmf_energy > dtmf_fft_energy * 0.3:
+                return None  # Too much energy at non-DTMF frequencies = voice
 
         # Check minimum power threshold
         frame_energy = np.sum(samples ** 2)
@@ -135,8 +164,14 @@ class DTMFDetector:
         if digit is None:
             return None
 
-        # Calculate confidence
-        confidence = min(dtmf_power / (other_power + 1), 1.0)
+        # Calculate confidence based on how clean the DTMF is
+        dtmf_ratio = dtmf_power / (other_dtmf_power + 1)
+        spectral_purity = dtmf_fft_energy / (dtmf_fft_energy + non_dtmf_energy + 1)
+        confidence = min(dtmf_ratio * spectral_purity / 5.0, 1.0)
+
+        # Require minimum confidence
+        if confidence < 0.5:
+            return None
 
         return digit, low_freq, high_freq, confidence
 
@@ -163,6 +198,9 @@ class DTMFDetector:
 
             result = self._detect_dtmf_in_frame(frame)
 
+            # Require minimum 3 consecutive frames (~120ms) for a valid DTMF digit
+            MIN_DTMF_FRAMES = 3
+
             if result is not None:
                 digit, low_freq, high_freq, confidence = result
 
@@ -176,7 +214,7 @@ class DTMFDetector:
                     digit_frames += 1
                 else:
                     # Different digit - save previous and start new
-                    if digit_frames >= 2:  # Minimum 2 frames (~80ms)
+                    if digit_frames >= MIN_DTMF_FRAMES:
                         digits.append(DTMFDigit(
                             digit=current_digit[0],
                             start_time=digit_start,
@@ -190,7 +228,7 @@ class DTMFDetector:
                     digit_frames = 1
             else:
                 # No DTMF - end current digit if any
-                if current_digit is not None and digit_frames >= 2:
+                if current_digit is not None and digit_frames >= MIN_DTMF_FRAMES:
                     digits.append(DTMFDigit(
                         digit=current_digit[0],
                         start_time=digit_start,
@@ -203,7 +241,7 @@ class DTMFDetector:
                 digit_frames = 0
 
         # Don't forget last digit
-        if current_digit is not None and digit_frames >= 2:
+        if current_digit is not None and digit_frames >= MIN_DTMF_FRAMES:
             digits.append(DTMFDigit(
                 digit=current_digit[0],
                 start_time=digit_start,
@@ -236,13 +274,18 @@ class DTMFDetector:
         if len(digits) == 0:
             return False, 0.0, "No DTMF detected"
 
+        # Check average confidence of detected digits
+        avg_confidence = np.mean([d.confidence for d in digits])
+        if avg_confidence < 0.6:
+            return False, 0.0, f"Low confidence DTMF ({avg_confidence:.2f}): {sequence}"
+
         # IVR indicators:
         # 1. Multiple digits with gaps (user pressing menu options)
         # 2. Common patterns: "1" for English, "2" for Spanish, etc.
         # 3. Short sequences followed by pauses
 
-        # Check for typical IVR patterns
-        if len(digits) >= 2:
+        # Check for typical IVR patterns - require at least 3 digits for confidence
+        if len(digits) >= 3:
             # Check for spaced-out digits (user responding to prompts)
             gaps = []
             for i in range(1, len(digits)):
@@ -251,15 +294,16 @@ class DTMFDetector:
 
             avg_gap = np.mean(gaps) if gaps else 0
 
-            if avg_gap > 1.0:  # Gaps > 1 second suggest IVR interaction
+            if avg_gap > 1.5:  # Gaps > 1.5 seconds suggest IVR interaction
                 return True, 0.8, f"IVR detected: {len(digits)} digits with {avg_gap:.1f}s avg gap"
 
-        # Check for single digit (menu selection)
-        if len(digits) == 1 and digits[0].digit in '0123456789':
-            return True, 0.5, f"Possible IVR: single digit '{digits[0].digit}'"
+        # Check for extension/PIN patterns (rapid sequence of 4+ digits)
+        if len(sequence) >= 4 and sequence.isdigit():
+            # Check that digits were pressed in quick succession
+            total_duration = digits[-1].start_time + digits[-1].duration - digits[0].start_time
+            if total_duration < 3.0:  # 4+ digits in under 3 seconds = likely extension
+                return True, 0.7, f"Extension/PIN pattern: {sequence}"
 
-        # Check for extension/PIN patterns
-        if len(sequence) >= 3 and sequence.isdigit():
-            return True, 0.6, f"Possible extension/PIN: {sequence}"
-
+        # Single digit or 2 digits is not enough to confirm IVR
+        # Could be accidental detection in voice
         return False, 0.0, f"DTMF sequence: {sequence}" if sequence else "No IVR pattern"

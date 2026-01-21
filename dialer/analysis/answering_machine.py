@@ -106,16 +106,30 @@ class AnsweringMachineDetector:
 
         Beeps are characterized by:
         - Tonal (low spectral flatness)
-        - Consistent frequency
+        - Consistent frequency throughout
         - Duration 100ms - 2s
+        - Comes AFTER some speech (not at the start)
         - Often followed by silence
         """
         beep_start = None
         beep_frames = 0
+        beep_freq = None
+
+        # Beep should not be at the very beginning - need at least 1 second of audio first
+        # Real voicemail: greeting -> beep -> silence (for recording)
+        min_start_frame = int(1.0 / self.frame_duration)  # At least 1 second in
 
         for i, frame in enumerate(frames):
+            # Skip the first second - beeps don't come at the very start
+            if i < min_start_frame:
+                continue
+
+            # Check for tonal quality with STRICT spectral flatness threshold
+            # Beeps are very pure tones with flatness < 0.05 (not just < 0.1)
+            is_pure_tone = frame['spectral_flatness'] < 0.05 and frame['energy'] > self.energy_threshold
+
             is_potential_beep = (
-                frame['is_tonal'] and
+                is_pure_tone and
                 any(abs(frame['dominant_freq'] - bf) < self.BEEP_TOLERANCE
                     for bf in self.BEEP_FREQUENCIES)
             )
@@ -123,18 +137,30 @@ class AnsweringMachineDetector:
             if is_potential_beep:
                 if beep_start is None:
                     beep_start = i
-                beep_frames += 1
+                    beep_freq = frame['dominant_freq']
+                    beep_frames = 1
+                else:
+                    # Check that frequency is consistent (within 20 Hz of first frame)
+                    if abs(frame['dominant_freq'] - beep_freq) < 20:
+                        beep_frames += 1
+                    else:
+                        # Frequency changed too much - not a clean beep
+                        beep_start = None
+                        beep_frames = 0
+                        beep_freq = None
             else:
                 if beep_frames >= self.min_beep_frames:
                     # Check if followed by silence or low energy
                     if i < len(frames) - 1:
                         next_frames = frames[i:min(i + 5, len(frames))]
-                        if any(f['is_silence'] for f in next_frames):
+                        silence_count = sum(1 for f in next_frames if f['is_silence'])
+                        if silence_count >= 2:  # At least 2 of next 5 frames are silent
                             return True, beep_start * self.frame_duration
                 beep_start = None
                 beep_frames = 0
+                beep_freq = None
 
-        # Check final beep
+        # Check final beep (must also be followed by end of recording = implied silence)
         if beep_frames >= self.min_beep_frames:
             return True, beep_start * self.frame_duration
 

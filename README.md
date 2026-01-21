@@ -1,10 +1,15 @@
 # War Dialer
 
-A phone line scanner that uses USB modems to dial numbers and classify what answers (fax, modem, voice, etc.) using audio frequency analysis, tone cadence detection, and machine learning.
+A phone line scanner that dials numbers and classifies what answers (fax, modem, voice, etc.) using audio frequency analysis, tone cadence detection, and machine learning.
+
+Supports two telephony backends:
+- **USB Modem** - Traditional hardware modem (voice-capable recommended)
+- **IAX2 VOIP** - Internet telephony via VOIP.MS or other IAX2 providers
 
 ## Features
 
-- **Voice mode audio capture** - Records audio when modem supports AT+FCLASS=8
+- **Dual provider support** - Use USB modems or IAX2 VOIP (e.g., voip.ms)
+- **Voice mode audio capture** - Records audio for analysis
 - **FFT-based classification** - Analyzes frequencies to identify fax, modem, dial tone, busy signals
 - **Tone cadence detection** - Detects busy (0.5s on/off) and ringback (2s on/4s off) timing patterns
 - **Answering machine detection** - Distinguishes voicemail/AM from live human voice
@@ -21,8 +26,9 @@ A phone line scanner that uses USB modems to dial numbers and classify what answ
 ## Requirements
 
 - Python 3.10+
-- USB modem (voice-capable recommended for full functionality)
-- Linux/macOS (for /dev/ttyACM* or /dev/ttyUSB* devices)
+- **One of:**
+  - USB modem (voice-capable recommended) on Linux/macOS
+  - IAX2 VOIP account (e.g., voip.ms) - no hardware needed
 
 ## Installation
 
@@ -53,7 +59,9 @@ pip install -e .
 
 ## Quick Start
 
-### 1. Detect and Test Your Modem
+### Option A: Using USB Modem (Default)
+
+#### 1. Detect and Test Your Modem
 
 ```bash
 dialer detect
@@ -83,7 +91,7 @@ OK - Modem reset successful
 └─────────────┴───────────────────────┘
 ```
 
-### 2. Test Dial Tone
+#### 2. Test Dial Tone
 
 ```bash
 dialer dialtone
@@ -91,15 +99,57 @@ dialer dialtone
 
 Verifies phone line is connected and has dial tone.
 
-### 3. Test a Single Number
+#### 3. Test a Single Number
 
 ```bash
 dialer call 5551234
 ```
 
-This dials one number and shows the classification result - useful for testing before running a full scan.
+#### 4. Run a Scan
 
-### 4. Run a Scan
+```bash
+dialer scan --numbers numbers.txt --name "Office PBX"
+```
+
+### Option B: Using IAX2 VOIP (e.g., voip.ms)
+
+#### 1. Configure IAX2 Credentials
+
+Edit `config.yaml`:
+```yaml
+provider: iax2
+
+iax2:
+  host: chicago3.voip.ms    # Your nearest POP
+  port: 4569
+  username: "your_username"
+  password: "your_password"
+  caller_id: "+15551234567"
+```
+
+Or use command-line options:
+```bash
+dialer call 5551234 --provider iax2 \
+  --iax2-host chicago3.voip.ms \
+  --iax2-user myuser \
+  --iax2-pass mypass
+```
+
+#### 2. Test a Single Number
+
+```bash
+dialer call 5551234 --provider iax2 -v
+```
+
+The `-v` flag shows verbose IAX2 protocol output for debugging.
+
+#### 3. Run a Scan
+
+```bash
+dialer scan --numbers numbers.txt --provider iax2 --name "VOIP Scan"
+```
+
+### Scan Options (Both Providers)
 
 **From a file (one number per line):**
 ```bash
@@ -182,15 +232,31 @@ dialer train --directory ./training_samples/
 
 ## Configuration
 
-Edit `config.yaml` to customize behavior:
+Copy `config.example.yaml` to `config.yaml` and customize:
 
 ```yaml
+# Choose provider: "modem" or "iax2"
+provider: modem
+
+# USB Modem settings
 modem:
   device: /dev/ttyACM0     # Or null for auto-detect
   baud_rate: 460800
   call_timeout: 45         # Seconds to wait for answer
-  record_duration: 30      # Seconds of audio to capture
-  audio_output_dir: "./recordings"
+  record_duration: 25      # Seconds of audio to capture
+  dial_mode: tone          # "tone" (ATDT) or "pulse" (ATDP)
+
+# IAX2 VOIP settings (for provider: iax2)
+iax2:
+  host: chicago3.voip.ms   # VOIP.MS POP or other IAX2 server
+  port: 4569
+  username: "your_username"
+  password: "your_password"
+  caller_id: "+15551234567"
+
+audio:
+  sample_rate: 8000
+  output_dir: "./recordings"
 
 scanner:
   call_delay: 3            # Seconds between calls
@@ -199,6 +265,8 @@ scanner:
 database:
   path: "./dialer.db"
 ```
+
+**Note:** `config.yaml` is in `.gitignore` to protect credentials. Use `config.example.yaml` as a template.
 
 ## Line Type Detection
 
@@ -251,7 +319,11 @@ dialer/
 │   ├── sit.py          # SIT tone decoder
 │   └── ml_classifier.py  # ML-based classifier
 ├── core/               # Core functionality
-│   ├── modem.py        # Modem AT command control
+│   ├── provider.py     # Abstract telephony provider interface
+│   ├── modem.py        # USB modem AT command control
+│   ├── modem_provider.py   # Modem provider wrapper
+│   ├── iax2.py         # IAX2 protocol implementation
+│   ├── iax2_provider.py    # IAX2 provider wrapper
 │   ├── scanner.py      # Scan orchestration
 │   └── audio.py        # Audio processing/DLE decode
 ├── storage/            # Data persistence
@@ -278,6 +350,44 @@ To check if your modem supports voice mode:
 dialer detect
 # Look for "Voice Mode: Supported"
 ```
+
+## IAX2 VOIP Setup
+
+IAX2 (Inter-Asterisk eXchange v2) lets you dial without hardware using VOIP providers like voip.ms.
+
+### Setting Up voip.ms
+
+1. Create account at [voip.ms](https://voip.ms)
+2. Add funds and purchase a DID (phone number)
+3. Create a sub-account with IAX2 enabled:
+   - Main Menu → Sub Accounts → Create Sub Account
+   - Enable "IAX2" protocol
+   - Note the username and set a password
+4. Find your nearest POP server (e.g., `chicago3.voip.ms`, `atlanta1.voip.ms`)
+
+### IAX2 Configuration
+
+```yaml
+provider: iax2
+
+iax2:
+  host: atlanta1.voip.ms    # Use POP nearest to your DID
+  port: 4569
+  username: "123456_subaccount"
+  password: "your_password"
+  caller_id: "+15551234567"  # Your DID
+```
+
+### IAX2 vs USB Modem
+
+| Feature | USB Modem | IAX2 VOIP |
+|---------|-----------|-----------|
+| Hardware required | Yes | No |
+| Setup complexity | Medium | Easy |
+| Call quality | Depends on line | Good |
+| Cost per call | Phone line rates | VOIP rates (~$0.01/min) |
+| Connection speed | 10-15 seconds | 1-2 seconds |
+| Geographic flexibility | Fixed location | Anywhere with internet |
 
 ## Logging
 

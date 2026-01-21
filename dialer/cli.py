@@ -23,6 +23,7 @@ from rich.table import Table
 
 from .analysis.signatures import LineType
 from .core.modem import Modem, ModemCapability, ModemError
+from .core.provider import CallResult, ProviderError
 from .core.scanner import Scanner, ScannerConfig, ScannerError
 from .storage.database import Database
 from .storage.models import ScanResult, ScanStatus, load_numbers_from_file, parse_number_range
@@ -160,40 +161,76 @@ def detect(ctx, device):
 
 @cli.command()
 @click.argument("number")
-@click.option("--device", "-d", help="Modem device")
+@click.option("--provider", type=click.Choice(["modem", "iax2"]), help="Telephony provider")
+@click.option("--device", "-d", help="Modem device (for modem provider)")
+@click.option("--iax2-host", help="IAX2 server host (e.g., chicago3.voip.ms)")
+@click.option("--iax2-user", help="IAX2 username")
+@click.option("--iax2-pass", help="IAX2 password")
+@click.option("--iax2-callerid", help="IAX2 caller ID")
 @click.option("--pulse", "-p", is_flag=True, help="Use pulse dialing (ATDP) instead of tone (ATDT)")
 @click.option("--detect-dial-tone", "-w", is_flag=True, help="Wait for dial tone before dialing")
+@click.option("--verbose", "-v", is_flag=True, help="Show verbose debug output")
 @click.pass_context
-def call(ctx, number, device, pulse, detect_dial_tone):
+def call(ctx, number, provider, device, iax2_host, iax2_user, iax2_pass, iax2_callerid, pulse, detect_dial_tone, verbose):
     """Test dial a single phone number."""
     config = ctx.obj["config"]
     modem_config = config.get("modem", {})
+    iax2_config = config.get("iax2", {})
     audio_config = config.get("audio", {})
 
     console.print(f"\n[bold]Testing: {number}[/bold]\n")
     logger.info(f"Test call to {number}")
 
-    # Determine dial mode
+    # Determine provider type
+    provider_type = provider or config.get("provider", "modem")
+
+    # Determine dial mode (modem only)
     dial_mode = "pulse" if pulse else modem_config.get("dial_mode", "tone")
     use_dial_tone = detect_dial_tone or modem_config.get("detect_dial_tone", False)
 
-    if dial_mode == "pulse":
-        console.print("[dim]Using pulse dialing[/dim]")
-    if use_dial_tone:
-        console.print("[dim]Waiting for dial tone before dialing[/dim]")
+    if provider_type == "modem":
+        console.print("[dim]Using USB modem provider[/dim]")
+        if dial_mode == "pulse":
+            console.print("[dim]Using pulse dialing[/dim]")
+        if use_dial_tone:
+            console.print("[dim]Waiting for dial tone before dialing[/dim]")
+    else:
+        host = iax2_host or iax2_config.get("host")
+        console.print(f"[dim]Using IAX2 provider ({host})[/dim]")
 
-    # Create minimal scanner config
+    # Enable verbose logging if requested
+    if verbose:
+        console.print("[dim]Verbose logging enabled[/dim]")
+        debug_handler = logging.StreamHandler()
+        debug_handler.setLevel(logging.DEBUG)
+        debug_handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+
+        for logger_name in ["dialer.core.scanner", "dialer.core.modem", "dialer.core.iax2", "dialer.core.iax2_provider"]:
+            log = logging.getLogger(logger_name)
+            log.setLevel(logging.DEBUG)
+            log.addHandler(debug_handler)
+
+    # Create scanner config
     scanner_cfg = ScannerConfig(
+        provider_type=provider_type,
+        # Modem settings
         modem_device=device or modem_config.get("device"),
         baud_rate=modem_config.get("baud_rate", 460800),
+        dial_mode=dial_mode,
+        detect_dial_tone=use_dial_tone,
+        init_string=modem_config.get("init_string"),
+        # IAX2 settings
+        iax2_host=iax2_host or iax2_config.get("host"),
+        iax2_port=iax2_config.get("port", 4569),
+        iax2_username=iax2_user or iax2_config.get("username"),
+        iax2_password=iax2_pass or iax2_config.get("password"),
+        iax2_caller_id=iax2_callerid or iax2_config.get("caller_id"),
+        # Common settings
         call_timeout=modem_config.get("call_timeout", 45),
         record_duration=modem_config.get("record_duration", 10),
         sample_rate=audio_config.get("sample_rate", 8000),
         audio_output_dir=audio_config.get("output_dir", "./recordings"),
         db_path=":memory:",  # Don't persist test calls
-        dial_mode=dial_mode,
-        detect_dial_tone=use_dial_tone,
-        init_string=modem_config.get("init_string"),
     )
 
     scanner = Scanner(scanner_cfg)
@@ -242,13 +279,13 @@ def call(ctx, number, device, pulse, detect_dial_tone):
         console.print(f"[red]Error:[/red] {e}")
         logger.error(f"Test call failed: {e}")
         sys.exit(1)
-    except ModemError as e:
-        console.print(f"[red]Modem error:[/red] {e}")
-        logger.error(f"Modem error: {e}")
+    except (ModemError, ProviderError) as e:
+        console.print(f"[red]Provider error:[/red] {e}")
+        logger.error(f"Provider error: {e}")
         sys.exit(1)
     finally:
-        if scanner.modem:
-            scanner.modem.disconnect()
+        if scanner.provider:
+            scanner.provider.disconnect()
 
 
 @cli.command()
@@ -256,16 +293,23 @@ def call(ctx, number, device, pulse, detect_dial_tone):
 @click.option("--range", "-r", "number_range", help="Number range (e.g., 5551000-5551010)")
 @click.option("--blacklist", "-b", help="File containing numbers to skip")
 @click.option("--name", default="Scan", help="Name for this scan")
-@click.option("--device", "-d", help="Modem device")
+@click.option("--provider", type=click.Choice(["modem", "iax2"]), help="Telephony provider")
+@click.option("--device", "-d", help="Modem device (for modem provider)")
+@click.option("--iax2-host", help="IAX2 server host (e.g., chicago3.voip.ms)")
+@click.option("--iax2-user", help="IAX2 username")
+@click.option("--iax2-pass", help="IAX2 password")
+@click.option("--iax2-callerid", help="IAX2 caller ID")
 @click.option("--resume", type=int, help="Resume scan by ID")
 @click.option("--pulse", "-p", is_flag=True, help="Use pulse dialing (ATDP) instead of tone (ATDT)")
 @click.option("--detect-dial-tone", "-w", is_flag=True, help="Wait for dial tone before each call")
+@click.option("--no-early-hangup", is_flag=True, help="Disable early hangup (record full audio)")
 @click.option("--verbose", "-v", is_flag=True, help="Show verbose debug output")
 @click.pass_context
-def scan(ctx, numbers, number_range, blacklist, name, device, resume, pulse, detect_dial_tone, verbose):
+def scan(ctx, numbers, number_range, blacklist, name, provider, device, iax2_host, iax2_user, iax2_pass, iax2_callerid, resume, pulse, detect_dial_tone, no_early_hangup, verbose):
     """Scan phone numbers for line type classification."""
     config = ctx.obj["config"]
     modem_config = config.get("modem", {})
+    iax2_config = config.get("iax2", {})
     audio_config = config.get("audio", {})
     scanner_config = config.get("scanner", {})
     db_config = config.get("database", {})
@@ -311,7 +355,10 @@ def scan(ctx, numbers, number_range, blacklist, name, device, resume, pulse, det
         console.print("[red]Error:[/red] No phone numbers to scan")
         sys.exit(1)
 
-    # Determine dial mode
+    # Determine provider type
+    provider_type = provider or config.get("provider", "modem")
+
+    # Determine dial mode (modem only)
     dial_mode = "pulse" if pulse else modem_config.get("dial_mode", "tone")
     use_dial_tone = detect_dial_tone or modem_config.get("detect_dial_tone", False)
 
@@ -319,13 +366,21 @@ def scan(ctx, numbers, number_range, blacklist, name, device, resume, pulse, det
     console.print(f"Scan: {name}")
     if not resume:
         console.print(f"Numbers to scan: {len(phone_numbers)}")
-    if dial_mode == "pulse":
-        console.print("[dim]Using pulse dialing[/dim]")
-    if use_dial_tone:
-        console.print("[dim]Dial tone detection enabled[/dim]")
+
+    # Display provider info
+    if provider_type == "iax2":
+        host = iax2_host or iax2_config.get("host")
+        console.print(f"[dim]Provider: IAX2 ({host})[/dim]")
+    else:
+        console.print("[dim]Provider: USB Modem[/dim]")
+        if dial_mode == "pulse":
+            console.print("[dim]Using pulse dialing[/dim]")
+        if use_dial_tone:
+            console.print("[dim]Dial tone detection enabled[/dim]")
+
     if verbose:
         console.print("[dim]Verbose logging enabled[/dim]")
-        # Enable debug logging for scanner and modem with console output
+        # Enable debug logging for scanner, modem, and IAX2 with console output
         debug_handler = logging.StreamHandler()
         debug_handler.setLevel(logging.DEBUG)
         debug_handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
@@ -337,14 +392,31 @@ def scan(ctx, numbers, number_range, blacklist, name, device, resume, pulse, det
         modem_logger = logging.getLogger("dialer.core.modem")
         modem_logger.setLevel(logging.DEBUG)
         modem_logger.addHandler(debug_handler)
+
+        iax2_logger = logging.getLogger("dialer.core.iax2")
+        iax2_logger.setLevel(logging.DEBUG)
+        iax2_logger.addHandler(debug_handler)
     console.print()
 
-    logger.info(f"Starting scan '{name}' with {len(phone_numbers)} numbers")
+    logger.info(f"Starting scan '{name}' with {len(phone_numbers)} numbers using {provider_type}")
 
     # Create scanner config
     scanner_cfg = ScannerConfig(
+        # Provider selection
+        provider_type=provider_type,
+        # Modem settings
         modem_device=device or modem_config.get("device"),
         baud_rate=modem_config.get("baud_rate", 460800),
+        dial_mode=dial_mode,
+        detect_dial_tone=use_dial_tone,
+        init_string=modem_config.get("init_string"),
+        # IAX2 settings
+        iax2_host=iax2_host or iax2_config.get("host"),
+        iax2_port=iax2_config.get("port", 4569),
+        iax2_username=iax2_user or iax2_config.get("username"),
+        iax2_password=iax2_pass or iax2_config.get("password"),
+        iax2_caller_id=iax2_callerid or iax2_config.get("caller_id"),
+        # Common settings
         call_timeout=modem_config.get("call_timeout", 45),
         record_duration=modem_config.get("record_duration", 10),
         sample_rate=audio_config.get("sample_rate", 8000),
@@ -352,9 +424,7 @@ def scan(ctx, numbers, number_range, blacklist, name, device, resume, pulse, det
         call_delay=scanner_config.get("call_delay", 3),
         max_retries=scanner_config.get("max_retries", 2),
         db_path=db_config.get("path", "./dialer.db"),
-        dial_mode=dial_mode,
-        detect_dial_tone=use_dial_tone,
-        init_string=modem_config.get("init_string"),
+        early_hangup=not no_early_hangup,
     )
 
     # Track results for live display

@@ -54,7 +54,12 @@ class SITResult:
 SIT_LOW = 913.8
 SIT_MID = 1370.6
 SIT_HIGH = 1776.7
-SIT_TOLERANCE = 30  # Hz tolerance for matching
+SIT_TOLERANCE = 20  # Hz tolerance for matching (stricter than before)
+
+# SIT timing requirements
+SIT_SEGMENT_MIN_MS = 250  # Minimum segment duration
+SIT_SEGMENT_MAX_MS = 400  # Maximum segment duration
+SIT_TOTAL_MAX_MS = 1500   # Maximum total duration for all 3 tones
 
 # SIT pattern definitions
 # Pattern: (seg1, seg2, seg3) where L=Low, M=Mid, H=High
@@ -111,10 +116,15 @@ class SITDecoder:
             return 'H'
         return None
 
-    def _find_dominant_frequency(self, samples: np.ndarray) -> float:
-        """Find the dominant frequency in a segment using FFT."""
+    def _find_dominant_frequency(self, samples: np.ndarray) -> tuple[float, float]:
+        """Find the dominant frequency in a segment using FFT.
+
+        Returns:
+            Tuple of (frequency, spectral_purity) where spectral_purity is 0-1.
+            High purity (>0.5) indicates a clean tone, low purity indicates voice/noise.
+        """
         if len(samples) == 0:
-            return 0.0
+            return 0.0, 0.0
 
         # Apply window
         window = np.hanning(len(samples))
@@ -127,27 +137,79 @@ class SITDecoder:
         # Find peak in SIT frequency range (800-2000 Hz)
         mask = (freqs >= 800) & (freqs <= 2000)
         if not np.any(mask):
-            return 0.0
+            return 0.0, 0.0
 
         masked_fft = np.where(mask, fft, 0)
         peak_idx = np.argmax(masked_fft)
+        peak_value = masked_fft[peak_idx]
 
-        return freqs[peak_idx]
+        # Calculate spectral purity: ratio of peak energy to total energy in range
+        # Pure tones have most energy at one frequency, voice is spread out
+        total_energy = np.sum(masked_fft)
+        if total_energy > 0:
+            # Consider energy within ±50Hz of peak as "peak energy"
+            peak_freq = freqs[peak_idx]
+            peak_mask = mask & (np.abs(freqs - peak_freq) <= 50)
+            peak_energy = np.sum(np.where(peak_mask, fft, 0))
+            spectral_purity = peak_energy / total_energy
+        else:
+            spectral_purity = 0.0
+
+        return freqs[peak_idx], spectral_purity
+
+    def _check_energy_consistency(self, samples: np.ndarray) -> float:
+        """Check if energy is consistent throughout samples (characteristic of tones).
+
+        Returns:
+            Consistency score 0-1. High = consistent (tone), Low = variable (voice).
+        """
+        if len(samples) < 100:
+            return 0.0
+
+        # Split into chunks and measure energy of each
+        chunk_size = len(samples) // 8
+        energies = []
+        for i in range(0, len(samples) - chunk_size, chunk_size):
+            chunk = samples[i:i + chunk_size]
+            energy = np.sqrt(np.mean(chunk ** 2))
+            energies.append(energy)
+
+        if len(energies) < 2:
+            return 0.0
+
+        # Calculate coefficient of variation
+        mean_energy = np.mean(energies)
+        if mean_energy < 0.001:
+            return 0.0
+
+        std_energy = np.std(energies)
+        cv = std_energy / mean_energy
+
+        # Low CV = consistent = tone, High CV = variable = voice
+        # CV < 0.2 is very consistent, CV > 0.5 is quite variable
+        if cv < 0.15:
+            return 1.0
+        elif cv < 0.3:
+            return 0.7
+        elif cv < 0.5:
+            return 0.3
+        else:
+            return 0.0
 
     def _detect_sit_segments(
         self,
         samples: np.ndarray
-    ) -> list[tuple[float, float, str]]:
+    ) -> list[tuple[float, float, float, str, float, float]]:
         """
         Detect SIT tone segments in audio.
 
         Returns:
-            List of (start_time, frequency, classification) tuples
+            List of (start_time, end_time, frequency, classification, purity, consistency) tuples
         """
         segments = []
 
-        # Look for tonal segments in the first 3 seconds
-        max_samples = min(len(samples), self.sample_rate * 3)
+        # Look for tonal segments in the first 2 seconds (SIT is ~1 second)
+        max_samples = min(len(samples), self.sample_rate * 2)
         frame_size = self.segment_samples // 3  # Use smaller frames for detection
 
         current_tone = None
@@ -164,20 +226,24 @@ class SITDecoder:
                 if current_tone is not None and len(tone_samples) > 0:
                     # Save segment
                     combined = np.concatenate(tone_samples)
-                    freq = self._find_dominant_frequency(combined)
+                    freq, purity = self._find_dominant_frequency(combined)
                     classification = self._classify_frequency(freq)
+                    consistency = self._check_energy_consistency(combined)
                     if classification:
                         segments.append((
                             tone_start / self.sample_rate,
+                            i / self.sample_rate,
                             freq,
-                            classification
+                            classification,
+                            purity,
+                            consistency
                         ))
                     current_tone = None
                     tone_samples = []
                 continue
 
             # Find dominant frequency
-            freq = self._find_dominant_frequency(frame)
+            freq, purity = self._find_dominant_frequency(frame)
             classification = self._classify_frequency(freq)
 
             if classification:
@@ -193,11 +259,15 @@ class SITDecoder:
                     # Different tone - save previous and start new
                     if tone_samples:
                         combined = np.concatenate(tone_samples)
-                        seg_freq = self._find_dominant_frequency(combined)
+                        seg_freq, seg_purity = self._find_dominant_frequency(combined)
+                        consistency = self._check_energy_consistency(combined)
                         segments.append((
                             tone_start / self.sample_rate,
+                            i / self.sample_rate,
                             seg_freq,
-                            current_tone
+                            current_tone,
+                            seg_purity,
+                            consistency
                         ))
                     current_tone = classification
                     tone_start = i
@@ -206,11 +276,15 @@ class SITDecoder:
                 # Not a SIT frequency - might be gap or different tone
                 if current_tone is not None and tone_samples:
                     combined = np.concatenate(tone_samples)
-                    seg_freq = self._find_dominant_frequency(combined)
+                    seg_freq, seg_purity = self._find_dominant_frequency(combined)
+                    consistency = self._check_energy_consistency(combined)
                     segments.append((
                         tone_start / self.sample_rate,
+                        i / self.sample_rate,
                         seg_freq,
-                        current_tone
+                        current_tone,
+                        seg_purity,
+                        consistency
                     ))
                     current_tone = None
                     tone_samples = []
@@ -218,11 +292,16 @@ class SITDecoder:
         # Don't forget last segment
         if current_tone is not None and tone_samples:
             combined = np.concatenate(tone_samples)
-            freq = self._find_dominant_frequency(combined)
+            freq, purity = self._find_dominant_frequency(combined)
+            consistency = self._check_energy_consistency(combined)
+            end_time = min(len(samples), tone_start + len(combined)) / self.sample_rate
             segments.append((
                 tone_start / self.sample_rate,
+                end_time,
                 freq,
-                current_tone
+                current_tone,
+                purity,
+                consistency
             ))
 
         return segments
@@ -252,14 +331,73 @@ class SITDecoder:
 
         # Take first 3 segments as the SIT pattern
         sit_segments = segments[:3]
-        pattern_tuple = tuple(s[2] for s in sit_segments)
+        # Segments are: (start_time, end_time, frequency, classification, purity, consistency)
+        pattern_tuple = tuple(s[3] for s in sit_segments)
         pattern_str = '-'.join(pattern_tuple)
-        frequencies = [s[1] for s in sit_segments]
+        frequencies = [s[2] for s in sit_segments]
+        purities = [s[4] for s in sit_segments]
+        consistencies = [s[5] for s in sit_segments]
+
+        # STRICT VALIDATION 1: Check segment timing
+        # Each segment should be 250-400ms, and all 3 should complete within 1.5 seconds
+        timing_valid = True
+        timing_issues = []
+
+        for i, seg in enumerate(sit_segments):
+            start_time, end_time = seg[0], seg[1]
+            duration_ms = (end_time - start_time) * 1000
+
+            if duration_ms < SIT_SEGMENT_MIN_MS:
+                timing_valid = False
+                timing_issues.append(f"Segment {i+1} too short ({duration_ms:.0f}ms)")
+            elif duration_ms > SIT_SEGMENT_MAX_MS:
+                timing_valid = False
+                timing_issues.append(f"Segment {i+1} too long ({duration_ms:.0f}ms)")
+
+        # Check total duration
+        total_duration_ms = (sit_segments[2][1] - sit_segments[0][0]) * 1000
+        if total_duration_ms > SIT_TOTAL_MAX_MS:
+            timing_valid = False
+            timing_issues.append(f"Total duration too long ({total_duration_ms:.0f}ms)")
+
+        if not timing_valid:
+            return SITResult(
+                is_sit=False,
+                category=SITCategory.UNKNOWN,
+                pattern=pattern_str,
+                confidence=0.0,
+                segment_frequencies=frequencies,
+                reasoning=f"Timing invalid: {'; '.join(timing_issues)}"
+            )
+
+        # STRICT VALIDATION 2: Check spectral purity (tones should be clean)
+        avg_purity = np.mean(purities)
+        if avg_purity < 0.4:
+            return SITResult(
+                is_sit=False,
+                category=SITCategory.UNKNOWN,
+                pattern=pattern_str,
+                confidence=0.0,
+                segment_frequencies=frequencies,
+                reasoning=f"Low spectral purity ({avg_purity:.2f}) - likely voice, not tones"
+            )
+
+        # STRICT VALIDATION 3: Check energy consistency (tones have steady energy)
+        avg_consistency = np.mean(consistencies)
+        if avg_consistency < 0.3:
+            return SITResult(
+                is_sit=False,
+                category=SITCategory.UNKNOWN,
+                pattern=pattern_str,
+                confidence=0.0,
+                segment_frequencies=frequencies,
+                reasoning=f"Energy too variable ({avg_consistency:.2f}) - likely voice, not tones"
+            )
 
         # Look up category
         category = SIT_PATTERNS.get(pattern_tuple, SITCategory.UNKNOWN)
 
-        # Calculate confidence based on frequency accuracy
+        # Calculate confidence based on multiple factors
         expected_freqs = []
         for cls in pattern_tuple:
             if cls == 'L':
@@ -269,14 +407,33 @@ class SITDecoder:
             else:
                 expected_freqs.append(SIT_HIGH)
 
+        # Frequency accuracy component
         freq_errors = [abs(f - e) / e for f, e in zip(frequencies, expected_freqs)]
         avg_error = np.mean(freq_errors)
-        confidence = max(0.0, 1.0 - avg_error * 5)
+        freq_confidence = max(0.0, 1.0 - avg_error * 10)  # Stricter penalty
+
+        # Purity and consistency components
+        purity_confidence = avg_purity
+        consistency_confidence = avg_consistency
+
+        # Combined confidence (all factors must be good)
+        confidence = (freq_confidence * 0.4 + purity_confidence * 0.3 + consistency_confidence * 0.3)
+
+        # Require minimum overall confidence
+        if confidence < 0.5:
+            return SITResult(
+                is_sit=False,
+                category=SITCategory.UNKNOWN,
+                pattern=pattern_str,
+                confidence=confidence,
+                segment_frequencies=frequencies,
+                reasoning=f"Confidence too low ({confidence:.2f}): freq={freq_confidence:.2f}, purity={purity_confidence:.2f}, consistency={consistency_confidence:.2f}"
+            )
 
         # Build reasoning
         description = SIT_DESCRIPTIONS.get(category, "Unknown")
         freq_str = ', '.join(f"{f:.0f} Hz" for f in frequencies)
-        reasoning = f"SIT {pattern_str}: {description} (frequencies: {freq_str})"
+        reasoning = f"SIT {pattern_str}: {description} (frequencies: {freq_str}, purity={avg_purity:.2f}, consistency={avg_consistency:.2f})"
 
         return SITResult(
             is_sit=True,

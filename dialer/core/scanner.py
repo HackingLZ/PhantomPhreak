@@ -13,7 +13,8 @@ from ..analysis.signatures import LineType
 from ..storage.database import Database
 from ..storage.models import Scan, ScanResult, ScanStatus
 from .audio import AudioCapture, save_wav
-from .modem import CallResult, Modem, ModemError
+from .modem import CallResult as ModemCallResult
+from .provider import CallResult, ProviderError, TelephonyProvider
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,21 @@ class ScannerConfig:
 
     def __init__(
         self,
+        # Provider selection
+        provider_type: str = "modem",  # "modem" or "iax2"
+        # Modem settings
         modem_device: Optional[str] = None,
         baud_rate: int = 460800,
+        dial_mode: str = "tone",
+        detect_dial_tone: bool = False,
+        init_string: Optional[str] = None,
+        # IAX2 settings
+        iax2_host: Optional[str] = None,
+        iax2_port: int = 4569,
+        iax2_username: Optional[str] = None,
+        iax2_password: Optional[str] = None,
+        iax2_caller_id: Optional[str] = None,
+        # Common settings
         call_timeout: float = 45.0,
         record_duration: float = 30.0,
         call_delay: float = 3.0,
@@ -38,16 +52,26 @@ class ScannerConfig:
         audio_output_dir: str = "./recordings",
         keep_audio_types: Optional[list[LineType]] = None,
         db_path: str = "./dialer.db",
-        dial_mode: str = "tone",
-        detect_dial_tone: bool = False,
-        init_string: Optional[str] = None,
         early_hangup: bool = True,
         early_hangup_interval: float = 3.0,
         early_hangup_types: Optional[list[LineType]] = None,
         early_hangup_min_confidence: float = 0.8,
     ):
+        # Provider selection
+        self.provider_type = provider_type
+        # Modem settings
         self.modem_device = modem_device
         self.baud_rate = baud_rate
+        self.dial_mode = dial_mode
+        self.detect_dial_tone = detect_dial_tone
+        self.init_string = init_string
+        # IAX2 settings
+        self.iax2_host = iax2_host
+        self.iax2_port = iax2_port
+        self.iax2_username = iax2_username
+        self.iax2_password = iax2_password
+        self.iax2_caller_id = iax2_caller_id
+        # Common settings
         self.call_timeout = call_timeout
         self.record_duration = record_duration
         self.call_delay = call_delay
@@ -61,7 +85,6 @@ class ScannerConfig:
             LineType.MODEM,
         ]
         self.db_path = db_path
-        self.dial_mode = dial_mode
         # Early hangup for quick fax/modem detection
         self.early_hangup = early_hangup
         self.early_hangup_interval = early_hangup_interval
@@ -73,8 +96,6 @@ class ScannerConfig:
             LineType.SIT_TONE,
         ]
         self.early_hangup_min_confidence = early_hangup_min_confidence
-        self.detect_dial_tone = detect_dial_tone
-        self.init_string = init_string
 
 
 class Scanner:
@@ -108,7 +129,7 @@ class Scanner:
         self.config = config
         self.progress_callback = progress_callback
 
-        self.modem: Optional[Modem] = None
+        self.provider: Optional[TelephonyProvider] = None
         self.db = Database(config.db_path)
         self.classifier = Classifier(sample_rate=config.sample_rate)
         self.audio_capture = AudioCapture(sample_rate=config.sample_rate)
@@ -117,34 +138,64 @@ class Scanner:
         self._stop_requested = False
         self._voice_mode_available = False
 
-    def _ensure_modem(self) -> None:
-        """Ensure modem is connected and initialized."""
-        if self.modem is None:
-            self.modem = Modem(
+        # Apply IAX2-specific settings (faster connection = need longer capture)
+        if config.provider_type == "iax2":
+            # IAX2 connects in 1-2s vs 10-15s for modem, so we need more time
+            # to capture full handshake for fax/modem distinction (2100 Hz + 2200 Hz)
+            if config.early_hangup_interval < 10.0:
+                config.early_hangup_interval = 10.0
+            # Remove SIT_TONE from early hangup - often confused with IVR on fast connects
+            if LineType.SIT_TONE in config.early_hangup_types:
+                config.early_hangup_types = [t for t in config.early_hangup_types if t != LineType.SIT_TONE]
+            # Use 20s record duration for IAX2 (vs 25s for modem)
+            if config.record_duration > 20:
+                config.record_duration = 20
+
+    def _create_provider(self) -> TelephonyProvider:
+        """Create a telephony provider based on configuration."""
+        if self.config.provider_type == "iax2":
+            from .iax2_provider import IAX2Provider
+
+            if not self.config.iax2_host:
+                raise ScannerError("IAX2 host is required for IAX2 provider")
+            if not self.config.iax2_username:
+                raise ScannerError("IAX2 username is required for IAX2 provider")
+            if not self.config.iax2_password:
+                raise ScannerError("IAX2 password is required for IAX2 provider")
+
+            return IAX2Provider(
+                host=self.config.iax2_host,
+                port=self.config.iax2_port,
+                username=self.config.iax2_username,
+                password=self.config.iax2_password,
+                caller_id=self.config.iax2_caller_id or '',
+            )
+        else:
+            # Default to modem provider
+            from .modem_provider import ModemProvider
+
+            return ModemProvider(
                 device=self.config.modem_device,
                 baud_rate=self.config.baud_rate,
                 dial_mode=self.config.dial_mode,
                 detect_dial_tone=self.config.detect_dial_tone,
+                sample_rate=self.config.sample_rate,
             )
 
-        if not hasattr(self.modem, '_serial') or self.modem._serial is None:
-            self.modem.connect()
+    def _ensure_provider(self) -> None:
+        """Ensure provider is connected and initialized."""
+        if self.provider is None:
+            self.provider = self._create_provider()
 
-            # Use full initialization sequence (matches wvdial defaults)
-            if self.config.init_string:
-                # Custom init string provided
-                self.modem.reset()
-                self.modem.send_command(self.config.init_string)
-            else:
-                # Use standard initialization
-                self.modem.initialize()
-
-            # Check if voice mode is supported (but don't initialize it yet)
-            # Voice mode will be initialized during dial_for_voice()
-            info = self.modem.get_info()
+        try:
+            self.provider.connect()
+            info = self.provider.get_info()
             self._voice_mode_available = info.voice_supported
+            logger.debug(f"Provider connected: {info.name}, voice={info.voice_supported}")
+        except ProviderError as e:
+            raise ScannerError(f"Failed to connect provider: {e}") from e
 
-    def _create_early_check_callback(self, number: str) -> Optional[Callable[[bytes, float], bool]]:
+    def _create_early_check_callback(self, number: str) -> Optional[Callable[[np.ndarray, float], bool]]:
         """
         Create early check callback for fax/modem detection.
 
@@ -154,11 +205,9 @@ class Scanner:
         if not self.config.early_hangup:
             return None
 
-        def check_for_early_hangup(raw_data: bytes, elapsed: float) -> bool:
+        def check_for_early_hangup(samples: np.ndarray, elapsed: float) -> bool:
             """Check partial audio for clear fax/modem signatures. Return False to stop."""
             try:
-                # Convert raw data to samples
-                samples = self.audio_capture.process_raw_data(raw_data)
                 if len(samples) < self.config.sample_rate:  # Need at least 1 second
                     return True  # Continue recording
 
@@ -192,8 +241,8 @@ class Scanner:
             Tuple of (call_result, audio_samples or None, duration)
         """
         logger.debug(f"[{number}] Starting dial_and_record")
-        self._ensure_modem()
-        logger.debug(f"[{number}] Modem ready")
+        self._ensure_provider()
+        logger.debug(f"[{number}] Provider ready")
 
         audio_samples = None
         duration = 0.0
@@ -201,49 +250,39 @@ class Scanner:
         # Use voice-aware dialing if voice mode is available
         if self._voice_mode_available:
             logger.debug(f"[{number}] Calling dial_for_voice...")
-            # dial_for_voice() uses semicolon method and switches to voice mode
-            result = self.modem.dial_for_voice(number, timeout=self.config.call_timeout)
+            result = self.provider.dial_for_voice(number, timeout=self.config.call_timeout)
             logger.debug(f"[{number}] dial_for_voice returned: {result}")
 
             if result == CallResult.VOICE:
                 try:
-                    logger.debug(f"[{number}] Starting voice receive...")
-                    # Start recording - modem is already in voice mode
-                    self.modem.start_voice_receive()
-
                     # Create early check callback for fax/modem detection
                     early_callback = self._create_early_check_callback(number)
 
                     logger.debug(f"[{number}] Reading voice data (max {self.config.record_duration}s)...")
-                    # Read raw audio data with optional early detection
-                    raw_data = self.modem.read_voice_data(
-                        self.config.record_duration,
+                    # Provider's read_voice_data returns decoded samples directly
+                    audio_samples = self.provider.read_voice_data(
+                        duration=self.config.record_duration,
+                        silence_timeout=5.0,
                         early_check_callback=early_callback,
-                        early_check_interval=self.config.early_hangup_interval
+                        early_check_interval=self.config.early_hangup_interval,
                     )
-                    logger.debug(f"[{number}] Got {len(raw_data)} bytes of audio")
 
-                    # Process to samples
-                    if raw_data:
-                        audio_samples = self.audio_capture.process_raw_data(raw_data)
+                    if audio_samples is not None and len(audio_samples) > 0:
                         duration = len(audio_samples) / self.config.sample_rate
-                        logger.debug(f"[{number}] Processed to {len(audio_samples)} samples ({duration:.1f}s)")
+                        logger.debug(f"[{number}] Got {len(audio_samples)} samples ({duration:.1f}s)")
+                    else:
+                        logger.debug(f"[{number}] No audio samples received")
 
-                    logger.debug(f"[{number}] Stopping voice receive...")
-                    self.modem.stop_voice_receive()
-                    logger.debug(f"[{number}] Voice receive stopped")
-
-                except ModemError as e:
-                    logger.debug(f"[{number}] ModemError during recording: {e}")
+                except ProviderError as e:
+                    logger.debug(f"[{number}] ProviderError during recording: {e}")
                     # Failed to record, but we still got a connection
                     pass
         else:
-            logger.debug(f"[{number}] No voice mode, using basic dial")
-            # No voice mode, just dial and check result
-            result = self.modem.dial(number, timeout=self.config.call_timeout)
-            logger.debug(f"[{number}] Basic dial returned: {result}")
+            logger.debug(f"[{number}] No voice mode available")
+            # Without voice mode we can only get call result without audio
+            result = self.provider.dial_for_voice(number, timeout=self.config.call_timeout)
+            logger.debug(f"[{number}] dial_for_voice returned: {result}")
 
-        # Skip hangup here - _reset_modem() will close serial port completely
         logger.debug(f"[{number}] dial_and_record complete, result={result}")
         return result, audio_samples, duration
 
@@ -269,11 +308,17 @@ class Scanner:
             return LineType.UNKNOWN, 0.0, [], "No dial tone"
 
         if call_result == CallResult.ERROR:
-            return LineType.UNKNOWN, 0.0, [], "Modem error"
+            return LineType.UNKNOWN, 0.0, [], "Provider error"
 
-        if call_result == CallResult.NO_CARRIER:
+        if call_result == CallResult.TIMEOUT:
+            return LineType.UNKNOWN, 0.0, [], "Timeout"
+
+        if call_result == CallResult.UNREACHABLE:
             # Could be fax/modem that dropped when no handshake
-            return LineType.UNKNOWN, 0.3, [], "No carrier - possible fax/modem"
+            return LineType.UNKNOWN, 0.3, [], "Unreachable - possible fax/modem"
+
+        if call_result == CallResult.REJECTED:
+            return LineType.UNKNOWN, 0.0, [], "Call rejected"
 
         # For answered calls, classify based on audio
         if audio_samples is not None and len(audio_samples) > 0:
@@ -289,7 +334,7 @@ class Scanner:
             )
 
         # Answered but no audio (voice mode not available)
-        if call_result in (CallResult.CONNECT, CallResult.VOICE):
+        if call_result == CallResult.VOICE:
             return LineType.UNKNOWN, 0.5, [], "Answered but no audio capture"
 
         return LineType.UNKNOWN, 0.0, [], "Unknown result"
@@ -361,18 +406,18 @@ class Scanner:
 
         return result
 
-    def _reset_modem(self) -> None:
-        """Fully disconnect and reset modem state for clean next call."""
-        logger.debug("_reset_modem: Disconnecting modem completely")
-        if self.modem:
+    def _reset_provider(self) -> None:
+        """Fully disconnect and reset provider state for clean next call."""
+        logger.debug("_reset_provider: Disconnecting provider completely")
+        if self.provider:
             try:
-                self.modem.disconnect()
+                self.provider.disconnect()
             except Exception as e:
-                logger.debug(f"_reset_modem: Disconnect error (ignored): {e}")
-        # Clear modem reference so _ensure_modem creates fresh connection
-        self.modem = None
+                logger.debug(f"_reset_provider: Disconnect error (ignored): {e}")
+        # Clear provider reference so _ensure_provider creates fresh connection
+        self.provider = None
         self._voice_mode_available = False
-        logger.debug("_reset_modem: Modem reset complete")
+        logger.debug("_reset_provider: Provider reset complete")
 
     def run_scan(
         self,
@@ -384,7 +429,7 @@ class Scanner:
         """
         Run a full scan on a list of phone numbers.
 
-        Each number is scanned with a fresh modem connection to avoid
+        Each number is scanned with a fresh provider connection to avoid
         state issues between calls.
 
         Args:
@@ -452,10 +497,10 @@ class Scanner:
                         result.retry_count = retry_count
                         logger.debug(f"[{number}] scan_number returned: {result.call_result}, {result.line_type}")
                     finally:
-                        # CRITICAL: Disconnect modem after EVERY call attempt
-                        # This ensures clean state for next call (like 'call' command does)
-                        logger.debug(f"[{number}] Resetting modem after call...")
-                        self._reset_modem()
+                        # CRITICAL: Disconnect provider after EVERY call attempt
+                        # This ensures clean state for next call
+                        logger.debug(f"[{number}] Resetting provider after call...")
+                        self._reset_provider()
 
                     # Check if we should retry
                     if result.call_result in retryable_results and retry_count < self.config.max_retries:
@@ -500,7 +545,7 @@ class Scanner:
 
         finally:
             # Final cleanup
-            self._reset_modem()
+            self._reset_provider()
             self._current_scan = None
 
         return scan
@@ -527,13 +572,27 @@ def create_scanner_from_config(config_path: str) -> Scanner:
         config_data = yaml.safe_load(f)
 
     modem_cfg = config_data.get("modem", {})
+    iax2_cfg = config_data.get("iax2", {})
     audio_cfg = config_data.get("audio", {})
     scanner_cfg = config_data.get("scanner", {})
     db_cfg = config_data.get("database", {})
 
     config = ScannerConfig(
+        # Provider selection
+        provider_type=config_data.get("provider", "modem"),
+        # Modem settings
         modem_device=modem_cfg.get("device"),
         baud_rate=modem_cfg.get("baud_rate", 460800),
+        dial_mode=modem_cfg.get("dial_mode", "tone"),
+        detect_dial_tone=modem_cfg.get("detect_dial_tone", False),
+        init_string=modem_cfg.get("init_string"),
+        # IAX2 settings
+        iax2_host=iax2_cfg.get("host"),
+        iax2_port=iax2_cfg.get("port", 4569),
+        iax2_username=iax2_cfg.get("username"),
+        iax2_password=iax2_cfg.get("password"),
+        iax2_caller_id=iax2_cfg.get("caller_id"),
+        # Common settings
         call_timeout=modem_cfg.get("call_timeout", 45),
         record_duration=modem_cfg.get("record_duration", 25),
         sample_rate=audio_cfg.get("sample_rate", 8000),
@@ -541,9 +600,6 @@ def create_scanner_from_config(config_path: str) -> Scanner:
         call_delay=scanner_cfg.get("call_delay", 3),
         max_retries=scanner_cfg.get("max_retries", 2),
         db_path=db_cfg.get("path", "./dialer.db"),
-        dial_mode=modem_cfg.get("dial_mode", "tone"),
-        detect_dial_tone=modem_cfg.get("detect_dial_tone", False),
-        init_string=modem_cfg.get("init_string"),
     )
 
     return Scanner(config)
