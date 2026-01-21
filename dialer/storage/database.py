@@ -276,6 +276,30 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def update_result(self, result: ScanResult) -> None:
+        """Update an existing scan result (e.g., after reanalysis)."""
+        if result.id is None:
+            raise ValueError("Result must have an ID to update")
+
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE scan_results SET
+                    line_type = ?,
+                    confidence = ?,
+                    frequencies = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (
+                    result.line_type.value,
+                    result.confidence,
+                    ",".join(map(str, result.frequencies)),
+                    result.notes,
+                    result.id,
+                )
+            )
+
     def get_interesting_results(self, scan_id: int) -> list[ScanResult]:
         """Get results classified as fax, modem, or other interesting types."""
         interesting_types = [

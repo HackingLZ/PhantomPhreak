@@ -518,6 +518,26 @@ def scan(ctx, numbers, number_range, blacklist, name, provider, device, iax2_hos
     # Show summary
     console.print("\n[bold]Scan Complete[/bold]\n")
 
+    # Show reclassifications if any
+    if scanner.reclassifications:
+        console.print(f"[yellow]Reclassified {len(scanner.reclassifications)} result(s) after reanalysis:[/yellow]\n")
+        reclass_table = Table(title="Reclassifications")
+        reclass_table.add_column("Phone Number", style="cyan")
+        reclass_table.add_column("Original", style="red")
+        reclass_table.add_column("", justify="center")
+        reclass_table.add_column("Corrected", style="green")
+
+        for r in scanner.reclassifications:
+            reclass_table.add_row(
+                r.phone_number,
+                f"{r.old_type.value} ({r.old_confidence:.0%})",
+                "->",
+                f"{r.new_type.value} ({r.new_confidence:.0%})",
+            )
+
+        console.print(reclass_table)
+        console.print()
+
     # Show recordings folder
     recordings_dir = Path(scanner_cfg.audio_output_dir) / str(scan_result.id)
     if recordings_dir.exists():

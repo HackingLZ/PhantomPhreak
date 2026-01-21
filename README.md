@@ -17,6 +17,7 @@ Supports two telephony backends:
 - **SIT tone decoding** - Decodes intercept messages (disconnected, circuits busy, etc.)
 - **Modem protocol detection** - Identifies V.21, V.22, V.22bis, V.32, V.34 modems
 - **Early hangup** - Automatically hangs up when fax/modem detected to save time
+- **Automatic reanalysis** - Re-classifies all recordings at scan completion for accuracy
 - **ML classification** - Train classifier on real samples for improved accuracy
 - **HTML reports** - Interactive reports with audio playback and spectrograms
 - **SQLite storage** - Persists results with export to CSV/JSON
@@ -164,6 +165,28 @@ dialer scan --range "5551000-5551050" --name "Test Range"
 **With a blacklist:**
 ```bash
 dialer scan --numbers numbers.txt --blacklist skip.txt --name "Filtered Scan"
+```
+
+### Automatic Reanalysis
+
+At the end of each scan, all saved recordings are automatically re-analyzed using the complete audio files. This corrects any misclassifications that may have occurred during live scanning due to early hangup or partial audio capture.
+
+If any results change, a reclassification table is displayed:
+```
+Reclassified 2 result(s) after reanalysis:
+
+         Reclassifications
+┌──────────────┬─────────────┬────┬───────────────┐
+│ Phone Number │ Original    │    │ Corrected     │
+├──────────────┼─────────────┼────┼───────────────┤
+│ 5551234      │ fax (85%)   │ -> │ voice (92%)   │
+│ 5551235      │ voice (75%) │ -> │ modem (95%)   │
+└──────────────┴─────────────┴────┴───────────────┘
+```
+
+You can also manually reanalyze a previous scan:
+```bash
+dialer reanalyze <scan_id>
 ```
 
 ### 5. View Results

@@ -355,9 +355,23 @@ class Classifier:
         matches.sort(key=lambda m: m.confidence, reverse=True)
 
         # CADENCE-BASED DETECTION: Use timing patterns
+        # BUSY SIGNAL: Must have cadence AND correct frequencies (480+620 Hz = 500+600 Hz rounded)
+        # Voice speech patterns can match busy cadence timing, so validate frequencies
         if cadence_result.pattern == CadencePattern.BUSY and cadence_result.confidence > 0.7:
-            return make_result(LineType.BUSY, cadence_result.confidence, False, False,
-                             f"Busy signal: {cadence_result.on_duration:.2f}s on / {cadence_result.off_duration:.2f}s off")
+            # Real busy signal has 500 and/or 600 Hz dominant, NOT broad spectrum
+            has_busy_freq = 500 in frequencies or 600 in frequencies
+            busy_freq_count = freq_counts.get(500, 0) + freq_counts.get(600, 0)
+
+            # Check if this looks like voice (many frequencies, variable energy)
+            is_voice_check, voice_conf = self._check_voice(analysis, frequencies)
+
+            # Only accept as busy if:
+            # 1. Has busy signal frequencies (500/600 Hz) AND
+            # 2. Does NOT have strong voice characteristics
+            if has_busy_freq and busy_freq_count >= 3 and (not is_voice_check or voice_conf < 0.4):
+                return make_result(LineType.BUSY, cadence_result.confidence, False, False,
+                                 f"Busy signal: {cadence_result.on_duration:.2f}s on / {cadence_result.off_duration:.2f}s off, freq 500/600Hz")
+            # Otherwise, cadence matched but frequencies don't - likely voice with speech pauses
 
         if cadence_result.pattern == CadencePattern.RINGBACK and cadence_result.confidence > 0.7:
             return make_result(LineType.RINGBACK, cadence_result.confidence, False, False,

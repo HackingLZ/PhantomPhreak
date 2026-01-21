@@ -2,6 +2,7 @@
 
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -98,6 +99,17 @@ class ScannerConfig:
         self.early_hangup_min_confidence = early_hangup_min_confidence
 
 
+@dataclass
+class Reclassification:
+    """Record of a reclassified result."""
+    phone_number: str
+    old_type: LineType
+    old_confidence: float
+    new_type: LineType
+    new_confidence: float
+    audio_file: str
+
+
 class Scanner:
     """
     Main scanner that orchestrates the wardialing process.
@@ -111,7 +123,8 @@ class Scanner:
        d. Analyze audio with FFT
        e. Classify line type
        f. Store results
-    3. Generate summary
+    3. Reanalyze all recordings for accuracy
+    4. Generate summary
     """
 
     def __init__(
@@ -137,6 +150,7 @@ class Scanner:
         self._current_scan: Optional[Scan] = None
         self._stop_requested = False
         self._voice_mode_available = False
+        self._reclassifications: list[Reclassification] = []
 
         # Apply IAX2-specific settings (faster connection = need longer capture)
         if config.provider_type == "iax2":
@@ -419,6 +433,69 @@ class Scanner:
         self._voice_mode_available = False
         logger.debug("_reset_provider: Provider reset complete")
 
+    def _reanalyze_scan_results(self, scan_id: int) -> list[Reclassification]:
+        """
+        Re-analyze all recordings from a scan using the classifier.
+
+        This runs at the end of a scan to correct any misclassifications
+        that occurred during live analysis (e.g., due to early hangup
+        or partial audio).
+
+        Returns:
+            List of Reclassification records for any changed results
+        """
+        reclassifications = []
+
+        # Get all results with audio files
+        results = self.db.get_results(scan_id)
+
+        for result in results:
+            if not result.audio_file:
+                continue
+
+            # Check if file exists
+            audio_path = Path(result.audio_file)
+            if not audio_path.exists():
+                logger.debug(f"[{result.phone_number}] Audio file not found: {audio_path}")
+                continue
+
+            try:
+                # Re-classify from the saved audio file
+                new_classification = self.classifier.classify_from_file(str(audio_path))
+
+                # Check if classification changed
+                if new_classification.line_type != result.line_type:
+                    logger.info(
+                        f"[{result.phone_number}] Reclassified: "
+                        f"{result.line_type.value} ({result.confidence:.0%}) -> "
+                        f"{new_classification.line_type.value} ({new_classification.confidence:.0%})"
+                    )
+
+                    # Record the reclassification
+                    reclassifications.append(Reclassification(
+                        phone_number=result.phone_number,
+                        old_type=result.line_type,
+                        old_confidence=result.confidence,
+                        new_type=new_classification.line_type,
+                        new_confidence=new_classification.confidence,
+                        audio_file=result.audio_file,
+                    ))
+
+                    # Update the result in database
+                    result.line_type = new_classification.line_type
+                    result.confidence = new_classification.confidence
+                    result.frequencies = list(set(
+                        f for m in new_classification.matches
+                        for f in m.matched_frequencies
+                    ))
+                    result.notes = f"[Reanalyzed] {new_classification.reasoning}"
+                    self.db.update_result(result)
+
+            except Exception as e:
+                logger.warning(f"[{result.phone_number}] Reanalysis failed: {e}")
+
+        return reclassifications
+
     def run_scan(
         self,
         numbers: list[str],
@@ -531,6 +608,13 @@ class Scanner:
                     time.sleep(self.config.call_delay)
                     logger.debug(f"[{number}] Delay complete, moving to next number")
 
+            # Reanalyze all recordings for improved accuracy
+            if not self._stop_requested:
+                logger.info("Reanalyzing recordings for final classification...")
+                self._reclassifications = self._reanalyze_scan_results(scan.id)
+                if self._reclassifications:
+                    logger.info(f"Reclassified {len(self._reclassifications)} result(s)")
+
             # Mark complete
             if not self._stop_requested:
                 scan.status = ScanStatus.COMPLETED
@@ -549,6 +633,11 @@ class Scanner:
             self._current_scan = None
 
         return scan
+
+    @property
+    def reclassifications(self) -> list[Reclassification]:
+        """Get reclassifications from the last scan."""
+        return self._reclassifications
 
     def stop(self) -> None:
         """Request scan to stop after current number."""
