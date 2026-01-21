@@ -89,7 +89,7 @@ FAX_CNG = ToneSignature(
     line_type=LineType.FAX,
     name="Fax CNG",
     frequencies={1100},  # 1100 Hz calling tone
-    optional_frequencies={1000, 1200},
+    optional_frequencies=set(),  # Removed - voice also has 1000/1200 Hz
     min_matches=1,
     description="Fax CNG tone (1100 Hz calling signal)"
 )

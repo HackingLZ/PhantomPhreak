@@ -412,12 +412,23 @@ class Classifier:
                     return make_result(LineType.INTERESTING, 0.6, False, False,
                                      f"Possible fax/modem: 2100 Hz detected ({fax_count} frames, {recording_duration}s), needs longer capture")
             else:
-                # 1100 Hz is more specific to fax (CNG calling tone)
-                if fax_count >= 3:
+                # 1100 Hz CNG is tricky - voice also has energy around 1100 Hz
+                # CNG is a pulsed tone (0.5s on, 3s off), voice is continuous with many frequencies
+                # Only classify as fax if:
+                # 1. High frame count (lots of 1100 Hz energy)
+                # 2. Few other frequencies (CNG is a pure tone, voice is broadband)
+                # 3. No voice-like characteristics
+                voice_like, voice_conf = self._check_voice(analysis, frequencies)
+
+                # CNG should NOT have voice characteristics
+                # If we have many frequencies (>8) or voice-like energy patterns, it's probably voice
+                if fax_count >= 5 and len(frequencies) <= 8 and not voice_like:
                     fax_match = next((m for m in matches if m.signature.line_type == LineType.FAX), None)
-                    confidence = max(fax_match.confidence if fax_match else 0.7, 0.85)
+                    confidence = max(fax_match.confidence if fax_match else 0.7, 0.80)
                     return make_result(LineType.FAX, confidence, False, False,
                                      f"Fax detected: {fax_freq} Hz CNG tone present in {fax_count} frames")
+                # If we have 1100 Hz but also voice characteristics, don't classify as fax here
+                # Let it fall through to voice detection
 
         # Check for voice
         is_voice, voice_confidence = self._check_voice(analysis, frequencies)
@@ -477,9 +488,23 @@ class Classifier:
         strong_tone_types = {LineType.FAX, LineType.MODEM, LineType.CARRIER, LineType.BUSY, LineType.SIT_TONE}
         if best_match and best_match.confidence >= self.min_confidence:
             if best_match.signature.line_type in strong_tone_types:
-                # These are distinctive tones, trust the match
-                return make_result(best_match.signature.line_type, best_match.confidence, is_voice, is_silence,
-                                 f"Matched {best_match.signature.name}: frequencies {best_match.matched_frequencies}")
+                # Special case: FAX CNG (1100 Hz) overlaps with voice frequencies
+                # Only trust FAX if it's CED (2100 Hz) OR if not voice-like
+                if best_match.signature.line_type == LineType.FAX:
+                    # Check if this is a 2100 Hz match (reliable) or 1100 Hz match (could be voice)
+                    has_2100_match = 2100 in best_match.matched_frequencies
+                    if not has_2100_match and is_voice:
+                        # 1100 Hz "fax" with voice characteristics - probably not fax
+                        # Let it fall through to voice detection
+                        pass
+                    else:
+                        # 2100 Hz fax OR 1100 Hz without voice characteristics
+                        return make_result(best_match.signature.line_type, best_match.confidence, is_voice, is_silence,
+                                         f"Matched {best_match.signature.name}: frequencies {best_match.matched_frequencies}")
+                else:
+                    # Other strong tones (modem, carrier, busy, SIT) - trust the match
+                    return make_result(best_match.signature.line_type, best_match.confidence, is_voice, is_silence,
+                                     f"Matched {best_match.signature.name}: frequencies {best_match.matched_frequencies}")
             elif not is_voice:
                 # Weak tone type but no voice detected
                 return make_result(best_match.signature.line_type, best_match.confidence, is_voice, is_silence,

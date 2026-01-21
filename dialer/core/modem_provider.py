@@ -183,11 +183,12 @@ class ModemProvider(TelephonyProvider):
 
         try:
             # Read raw voice data from modem
+            # Use longer min_record_time for fax/modem which may take time to answer
             raw_data = self._modem.read_voice_data(
                 duration=duration,
                 silence_timeout=silence_timeout,
                 silence_threshold=3,  # Low level for silence detection
-                min_record_time=5.0,  # Don't stop early in first 5 seconds
+                min_record_time=10.0,  # Don't stop early in first 10 seconds (fax needs time)
                 early_check_callback=internal_callback,
                 early_check_interval=early_check_interval,
             )
