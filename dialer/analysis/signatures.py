@@ -27,6 +27,7 @@ class LineType(Enum):
     SILENCE = "silence"
     UNKNOWN = "unknown"
     CARRIER = "carrier"  # Generic data carrier
+    INTERESTING = "interesting"  # Ambiguous signal needing manual review
     # Specific modem protocols
     MODEM_V21 = "modem_v21"  # 300 baud
     MODEM_V22 = "modem_v22"  # 1200 baud
